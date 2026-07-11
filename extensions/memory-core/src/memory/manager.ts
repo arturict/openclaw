@@ -16,6 +16,7 @@ import {
   readMemoryFile,
   MEMORY_EMBEDDING_CACHE_TABLE,
   MEMORY_INDEX_FTS_TABLE,
+  MEMORY_INDEX_PATHS_FTS_TABLE,
   MEMORY_INDEX_VECTOR_TABLE,
   type MemoryEmbeddingProbeResult,
   type MemoryProviderStatus,
@@ -57,7 +58,13 @@ import {
 } from "./manager-provider-state.js";
 import type { MemoryIndexIdentityState } from "./manager-reindex-state.js";
 import { resolveMemorySearchPreflight } from "./manager-search-preflight.js";
-import { searchKeyword, searchVector } from "./manager-search.js";
+import {
+  resolveExactPathSpecificity,
+  searchKeyword,
+  searchPathKeyword,
+  searchVector,
+  type ExactPathSpecificity,
+} from "./manager-search.js";
 import {
   collectMemoryStatusAggregate,
   resolveInitialMemoryDirty,
@@ -83,6 +90,7 @@ function getLocalEmbeddingRuntimeFacts(provider: EmbeddingProvider | null): unkn
 const SNIPPET_MAX_CHARS = 700;
 const VECTOR_TABLE = MEMORY_INDEX_VECTOR_TABLE;
 const FTS_TABLE = MEMORY_INDEX_FTS_TABLE;
+const PATH_FTS_TABLE = MEMORY_INDEX_PATHS_FTS_TABLE;
 const EMBEDDING_CACHE_TABLE = MEMORY_EMBEDDING_CACHE_TABLE;
 const MEMORY_INDEX_MANAGER_CACHE_KEY = Symbol.for("openclaw.memoryIndexManagerCache");
 export const EMBEDDING_PROBE_CACHE_TTL_MS = 30_000;
@@ -104,7 +112,42 @@ type EmbeddingProbeCacheEntry = {
   expireAtMs: number;
 };
 
-type KeywordSearchHit = MemorySearchResult & { id: string; textScore: number };
+type KeywordSearchHit = MemorySearchResult & {
+  id: string;
+  textScore: number;
+  pathScore: number;
+  exactPathSpecificity: ExactPathSpecificity;
+};
+
+function compareKeywordSearchHits(a: KeywordSearchHit, b: KeywordSearchHit): number {
+  const specificityDelta = b.exactPathSpecificity - a.exactPathSpecificity;
+  if (specificityDelta !== 0) {
+    return specificityDelta;
+  }
+  if (a.exactPathSpecificity > 0) {
+    const bodyPresenceDelta = Number(b.textScore > 0) - Number(a.textScore > 0);
+    if (bodyPresenceDelta !== 0) {
+      return bodyPresenceDelta;
+    }
+  }
+  // Score carries body relevance plus any configured decay. Exact tiers ignore
+  // path BM25 because specificity already owns path precedence.
+  const relevanceDelta = b.score - a.score;
+  if (relevanceDelta !== 0) {
+    return relevanceDelta;
+  }
+  const textDelta = b.textScore - a.textScore;
+  if (textDelta !== 0) {
+    return textDelta;
+  }
+  if (a.exactPathSpecificity === 0) {
+    const pathDelta = b.pathScore - a.pathScore;
+    if (pathDelta !== 0) {
+      return pathDelta;
+    }
+  }
+  return a.path.localeCompare(b.path) || a.startLine - b.startLine || a.id.localeCompare(b.id);
+}
 
 const EMBEDDING_PROBE_CACHE = new Map<string, EmbeddingProbeCacheEntry>();
 
@@ -743,8 +786,8 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
         temporalDecay: hybrid.temporalDecay,
         workspaceDir: this.workspaceDir,
       });
-      const sorted = decayed.toSorted((a, b) => b.score - a.score);
-      return this.selectScoredResults(sorted, maxResults, minScore, 0);
+      const ranked = this.rankKeywordOnlyResults(decayed);
+      return this.toMemorySearchResults(this.selectScoredResults(ranked, maxResults, minScore, 0));
     }
 
     // If FTS isn't available, hybrid mode cannot use keyword search; degrade to vector-only.
@@ -792,7 +835,10 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
         queryVec = await this.embedQueryWithRetry(cleaned, opts?.signal);
       } else if (!this.provider && this.fts.enabled && this.fts.available) {
         log.warn(`memory search: embeddings unavailable; using keyword-only results: ${message}`);
-        return this.selectScoredResults(keywordResults, maxResults, minScore, 0);
+        const ranked = this.rankKeywordOnlyResults(keywordResults);
+        return this.toMemorySearchResults(
+          this.selectScoredResults(ranked, maxResults, minScore, 0),
+        );
       } else {
         throw err;
       }
@@ -810,6 +856,7 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
     }
 
     const merged = await this.mergeHybridResults({
+      query: cleaned,
       vector: vectorResults,
       keyword: keywordResults,
       vectorWeight: hybrid.vectorWeight,
@@ -852,6 +899,14 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
       return strict.slice(0, maxResults);
     }
     return results.filter((entry) => entry.score >= relaxedMinScore).slice(0, maxResults);
+  }
+
+  private rankKeywordOnlyResults(results: KeywordSearchHit[]): KeywordSearchHit[] {
+    return results
+      .toSorted(compareKeywordSearchHits)
+      .map((entry) =>
+        entry.exactPathSpecificity > 0 ? Object.assign(entry, { score: 1 }) : entry,
+      );
   }
 
   private hasIndexedContent(): boolean {
@@ -913,20 +968,45 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
     if (!this.fts.enabled || !this.fts.available) {
       return [];
     }
-    const sourceFilter = this.buildSourceFilter(undefined, sourceFilterList);
-    const results = await searchKeyword({
+    const bodySearch = searchKeyword({
       db: this.db,
       ftsTable: FTS_TABLE,
       query,
       ftsTokenizer: this.settings.store.fts.tokenizer,
       limit,
       snippetMaxChars: SNIPPET_MAX_CHARS,
-      sourceFilter,
+      sourceFilter: this.buildSourceFilter(undefined, sourceFilterList),
       buildFtsQuery: (raw) => this.buildFtsQuery(raw),
       bm25RankToScore,
       boostFallbackRanking: options?.boostFallbackRanking,
+    }).catch((err: unknown) => {
+      log.warn(`memory search: body keyword query failed: ${formatErrorMessage(err)}`);
+      return [];
     });
-    return results.map((entry) => entry as KeywordSearchHit);
+    const pathSearch = searchPathKeyword({
+      db: this.db,
+      pathFtsTable: PATH_FTS_TABLE,
+      query,
+      ftsTokenizer: this.settings.store.fts.tokenizer,
+      limit,
+      snippetMaxChars: SNIPPET_MAX_CHARS,
+      sourceFilter: this.buildSourceFilter(PATH_FTS_TABLE, sourceFilterList),
+      buildFtsQuery: (raw) => this.buildFtsQuery(raw),
+      bm25RankToScore,
+    }).catch((err: unknown) => {
+      log.warn(`memory search: path keyword query failed: ${formatErrorMessage(err)}`);
+      return [];
+    });
+    const [bodyResults, pathResults] = await Promise.all([bodySearch, pathSearch]);
+    return this.mergeKeywordSearchHits([
+      bodyResults.map((entry) =>
+        Object.assign(entry, {
+          exactPathSpecificity: resolveExactPathSpecificity(query, entry.path),
+          pathScore: 0,
+        }),
+      ),
+      pathResults,
+    ]).slice(0, limit);
   }
 
   private async searchKeywordWithFallback(
@@ -958,7 +1038,7 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
         this.searchKeyword(term, limit, options, sourceFilterList).catch(() => []),
       ),
     );
-    return this.mergeKeywordSearchHits(resultSets);
+    return this.mergeKeywordSearchHits(resultSets, query);
   }
 
   private resolveKeywordFallbackTerms(query: string): string[] {
@@ -968,26 +1048,80 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
     return keywords.slice(0, KEYWORD_FALLBACK_SEARCH_TERM_LIMIT);
   }
 
-  private mergeKeywordSearchHits(resultSets: KeywordSearchHit[][]): KeywordSearchHit[] {
+  private mergeKeywordSearchHits(
+    resultSets: KeywordSearchHit[][],
+    exactPathQuery?: string,
+  ): KeywordSearchHit[] {
     const seenIds = new Map<string, KeywordSearchHit>();
     for (const results of resultSets) {
       for (const result of results) {
         const existing = seenIds.get(result.id);
-        if (
-          !existing ||
-          result.textScore > existing.textScore ||
-          (result.textScore === existing.textScore && result.score > existing.score)
-        ) {
+        if (!existing) {
           seenIds.set(result.id, result);
+          continue;
+        }
+        const existingHasBody = existing.textScore > 0;
+        const resultHasBody = result.textScore > 0;
+        const existingBodyScore = existingHasBody ? existing.score : 0;
+        const resultBodyScore = resultHasBody ? result.score : 0;
+        existing.textScore = Math.max(existing.textScore, result.textScore);
+        existing.pathScore = Math.max(existing.pathScore, result.pathScore);
+        existing.exactPathSpecificity = Math.max(
+          existing.exactPathSpecificity,
+          result.exactPathSpecificity,
+        ) as ExactPathSpecificity;
+        const bodyScore = Math.max(existingBodyScore, resultBodyScore);
+        existing.score = bodyScore > 0 ? bodyScore : existing.pathScore;
+        // Path hits project the first chunk; keep a real body-match snippet
+        // authoritative when both retrieval surfaces find the same document.
+        if (
+          (resultHasBody && !existingHasBody) ||
+          (resultHasBody === existingHasBody && result.snippet.length > existing.snippet.length)
+        ) {
+          existing.snippet = result.snippet;
         }
       }
     }
-    return [...seenIds.values()].toSorted((a, b) => b.score - a.score);
+    const merged = [...seenIds.values()];
+    if (exactPathQuery !== undefined) {
+      // Fallback terms broaden lexical recall, but only the original user query
+      // can claim exact path, basename, or stem precedence.
+      for (const result of merged) {
+        result.exactPathSpecificity = resolveExactPathSpecificity(exactPathQuery, result.path);
+      }
+    }
+    for (const result of merged) {
+      if (result.textScore === 0) {
+        // A uniform exact-only baseline lets temporal decay order otherwise
+        // equivalent filename hits without reusing incomparable path BM25.
+        result.score = result.exactPathSpecificity > 0 ? 1 : result.pathScore;
+      }
+    }
+    return merged.toSorted(compareKeywordSearchHits);
+  }
+
+  private toMemorySearchResults(results: KeywordSearchHit[]): MemorySearchResult[] {
+    return results.map(
+      ({
+        id: _id,
+        pathScore: _pathScore,
+        exactPathSpecificity: _exactPathSpecificity,
+        ...result
+      }) => result,
+    );
   }
 
   private mergeHybridResults(params: {
+    query: string;
     vector: Array<MemorySearchResult & { id: string }>;
-    keyword: Array<MemorySearchResult & { id: string; textScore: number }>;
+    keyword: Array<
+      MemorySearchResult & {
+        id: string;
+        textScore: number;
+        pathScore: number;
+        exactPathSpecificity: ExactPathSpecificity;
+      }
+    >;
     vectorWeight: number;
     textWeight: number;
     mmr?: { enabled: boolean; lambda: number };
@@ -1002,6 +1136,7 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
         source: r.source,
         snippet: r.snippet,
         vectorScore: r.score,
+        exactPathSpecificity: resolveExactPathSpecificity(params.query, r.path),
       })),
       keyword: params.keyword.map((r) => ({
         id: r.id,
@@ -1011,6 +1146,8 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
         source: r.source,
         snippet: r.snippet,
         textScore: r.textScore,
+        pathScore: r.pathScore,
+        exactPathSpecificity: r.exactPathSpecificity,
       })),
       vectorWeight: params.vectorWeight,
       textWeight: params.textWeight,
